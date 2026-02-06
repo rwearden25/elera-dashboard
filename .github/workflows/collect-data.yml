@@ -1,0 +1,59 @@
+name: Collect ELERA Data
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+      
+      - name: Collect Cluster Data
+        run: |
+          clusters=$(az aks list -o json)
+          echo '{"generatedAt":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","clusters":[],"deployments":[],"summary":{"totalClusters":0,"runningClusters":0,"stoppedClusters":0,"totalDeployments":0}}' > data.json
+          
+          for row in $(echo "$clusters" | jq -r '.[] | @base64'); do
+            name=$(echo ${row} | base64 --decode | jq -r '.name')
+            rg=$(echo ${row} | base64 --decode | jq -r '.resourceGroup')
+            state=$(echo ${row} | base64 --decode | jq -r '.powerState.code')
+            
+            echo "Processing: $name ($state)"
+            
+            jq --arg n "$name" --arg r "$rg" --arg s "$state" '.clusters += [{"name":$n,"resourceGroup":$r,"powerState":$s}]' data.json > tmp.json && mv tmp.json data.json
+            
+            [ "$state" != "Running" ] && continue
+            
+            az aks get-credentials -g $rg -n $name --overwrite-existing
+            
+            for ns in $(kubectl get ns -o jsonpath='{.items[*].metadata.name}'); do
+              if kubectl get pods -n $ns 2>/dev/null | grep -q elera; then
+                host=$(kubectl get ingress -n $ns -o jsonpath='{.items[0].spec.rules[0].host}' 2>/dev/null || echo "")
+                version=$(kubectl get pods -n $ns -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null | grep -oP '\d+\.\d+' | head -1 || echo "unknown")
+                url=""
+                [ -n "$host" ] && url="https://$host/admin-ui"
+                
+                jq --arg c "$name" --arg ns "$ns" --arg v "$version" --arg u "$url" \
+                  '.deployments += [{"cluster":$c,"namespace":$ns,"version":$v,"adminUiUrl":$u}]' data.json > tmp.json && mv tmp.json data.json
+                
+                echo "  Found: $ns (v$version)"
+              fi
+            done
+          done
+          
+          cat data.json
+      
+      - name: Upload to Blob
+        run: |
+          az storage blob upload --account-name eleradashboardstorage --container-name dashboard-data --name elera-clusters.json --file data.json --overwrite --auth-mode login
